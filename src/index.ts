@@ -13,6 +13,34 @@ import {
 } from "./grok-client.js";
 import type { GrokWebSearchTool, GrokXSearchTool, GrokTool } from "./types.js";
 
+// ─── Logging ────────────────────────────────────────────────────────────────
+
+function log(level: "info" | "warn" | "error", msg: string, data?: Record<string, unknown>): void {
+  const entry = {
+    ts: new Date().toISOString(),
+    level,
+    msg,
+    ...data,
+  };
+  console.error(JSON.stringify(entry));
+}
+
+function logRequest(req: IncomingMessage, statusCode: number, durationMs: number, extra?: Record<string, unknown>): void {
+  const ip = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim()
+    || req.headers["cf-connecting-ip"]
+    || req.socket.remoteAddress
+    || "unknown";
+  log("info", "http_request", {
+    method: req.method,
+    url: req.url,
+    status: statusCode,
+    ip,
+    ua: req.headers["user-agent"],
+    duration_ms: durationMs,
+    ...extra,
+  });
+}
+
 // ─── Server ─────────────────────────────────────────────────────────────────
 
 const server = new McpServer({
@@ -41,13 +69,35 @@ function checkBearer(req: IncomingMessage): boolean {
   return activeTokens.has(auth.slice(7));
 }
 
+// ─── Stats ──────────────────────────────────────────────────────────────────
+
+const stats = {
+  totalRequests: 0,
+  toolCalls: { grok_web_search: 0, grok_x_search: 0, grok_search: 0 } as Record<string, number>,
+  errors: 0,
+  startedAt: new Date().toISOString(),
+};
+
 // ─── Shared response handler ────────────────────────────────────────────────
 
 function handleGrokResponse(
   response: { error?: { message: string; type: string }; output: unknown[] },
-  rawOutput: boolean
+  rawOutput: boolean,
+  toolName: string,
+  query: string,
+  startTime: number,
 ): { content: Array<{ type: "text"; text: string }>; isError?: boolean } {
+  const durationMs = Date.now() - startTime;
+
   if (response.error) {
+    stats.errors++;
+    log("error", "grok_api_error", {
+      tool: toolName,
+      query,
+      error_type: response.error.type,
+      error_message: response.error.message,
+      duration_ms: durationMs,
+    });
     return {
       content: [
         {
@@ -60,6 +110,7 @@ function handleGrokResponse(
   }
 
   if (rawOutput) {
+    log("info", "tool_call_ok", { tool: toolName, query, raw: true, duration_ms: durationMs });
     return {
       content: [{ type: "text", text: extractRawOutput(response.output as any) }],
     };
@@ -68,6 +119,7 @@ function handleGrokResponse(
   const parsed = parseGrokOutput(response as any);
 
   if (!parsed.text.trim()) {
+    log("warn", "grok_empty_response", { tool: toolName, query, duration_ms: durationMs });
     return {
       content: [
         {
@@ -77,6 +129,14 @@ function handleGrokResponse(
       ],
     };
   }
+
+  log("info", "tool_call_ok", {
+    tool: toolName,
+    query,
+    citations: parsed.citations.length,
+    text_length: parsed.text.length,
+    duration_ms: durationMs,
+  });
 
   const content: Array<{ type: "text"; text: string }> = [
     { type: "text", text: parsed.text },
@@ -157,6 +217,11 @@ IMPORTANT: You MUST preserve and cite the source URLs from the SOURCES block in 
     },
   },
   async (params) => {
+    const startTime = Date.now();
+    stats.totalRequests++;
+    stats.toolCalls.grok_web_search++;
+    log("info", "tool_call", { tool: "grok_web_search", query: params.query });
+
     try {
       const config = getConfig();
 
@@ -174,9 +239,11 @@ IMPORTANT: You MUST preserve and cite the source URLs from the SOURCES block in 
       const tools: GrokTool[] = [webSearchTool];
       const systemPrompt = params.system_prompt || SEARCH_SYSTEM_PROMPT;
       const response = await callGrokResponses(config, params.query, tools, systemPrompt);
-      return handleGrokResponse(response, params.raw_output);
+      return handleGrokResponse(response, params.raw_output, "grok_web_search", params.query, startTime);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
+      stats.errors++;
+      log("error", "tool_call_error", { tool: "grok_web_search", query: params.query, error: msg, duration_ms: Date.now() - startTime });
       return {
         content: [{ type: "text" as const, text: `Error: ${msg}` }],
         isError: true,
@@ -243,6 +310,11 @@ IMPORTANT: You MUST preserve and cite the source URLs from the SOURCES block in 
     },
   },
   async (params) => {
+    const startTime = Date.now();
+    stats.totalRequests++;
+    stats.toolCalls.grok_x_search++;
+    log("info", "tool_call", { tool: "grok_x_search", query: params.query });
+
     try {
       const config = getConfig();
 
@@ -263,9 +335,11 @@ IMPORTANT: You MUST preserve and cite the source URLs from the SOURCES block in 
       const tools: GrokTool[] = [xSearchTool];
       const systemPrompt = params.system_prompt || SEARCH_SYSTEM_PROMPT;
       const response = await callGrokResponses(config, params.query, tools, systemPrompt);
-      return handleGrokResponse(response, params.raw_output);
+      return handleGrokResponse(response, params.raw_output, "grok_x_search", params.query, startTime);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
+      stats.errors++;
+      log("error", "tool_call_error", { tool: "grok_x_search", query: params.query, error: msg, duration_ms: Date.now() - startTime });
       return {
         content: [{ type: "text" as const, text: `Error: ${msg}` }],
         isError: true,
@@ -310,6 +384,11 @@ IMPORTANT: You MUST preserve and cite the source URLs from the SOURCES block in 
     },
   },
   async (params) => {
+    const startTime = Date.now();
+    stats.totalRequests++;
+    stats.toolCalls.grok_search++;
+    log("info", "tool_call", { tool: "grok_search", query: params.query });
+
     try {
       const config = getConfig();
 
@@ -319,9 +398,11 @@ IMPORTANT: You MUST preserve and cite the source URLs from the SOURCES block in 
       ];
       const systemPrompt = params.system_prompt || SEARCH_SYSTEM_PROMPT;
       const response = await callGrokResponses(config, params.query, tools, systemPrompt);
-      return handleGrokResponse(response, params.raw_output);
+      return handleGrokResponse(response, params.raw_output, "grok_search", params.query, startTime);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
+      stats.errors++;
+      log("error", "tool_call_error", { tool: "grok_search", query: params.query, error: msg, duration_ms: Date.now() - startTime });
       return {
         content: [{ type: "text" as const, text: `Error: ${msg}` }],
         isError: true,
@@ -335,7 +416,7 @@ IMPORTANT: You MUST preserve and cite the source URLs from the SOURCES block in 
 async function runStdio(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("grok-search-mcp-server running on stdio");
+  log("info", "server_started", { transport: "stdio" });
 }
 
 async function runHTTP(): Promise<void> {
@@ -350,9 +431,22 @@ async function runHTTP(): Promise<void> {
   }
 
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    const reqStart = Date.now();
+
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "POST, GET, DELETE, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+    // Patch res.end to log after response is sent
+    const origEnd = res.end.bind(res);
+    res.end = function (...args: any[]) {
+      const result = origEnd(...args);
+      // Don't log health checks to reduce noise
+      if (req.url !== "/health") {
+        logRequest(req, res.statusCode, Date.now() - reqStart);
+      }
+      return result;
+    } as any;
 
     if (req.method === "OPTIONS") {
       res.writeHead(204);
@@ -392,7 +486,7 @@ async function runHTTP(): Promise<void> {
           redirectUris: data.redirect_uris || [],
         });
 
-        console.error(`OAuth: registered client ${newClientId} (${data.client_name || "mcp-client"})`);
+        log("info", "oauth_register", { client_id: newClientId, client_name: data.client_name });
 
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
@@ -413,11 +507,13 @@ async function runHTTP(): Promise<void> {
       const url = new URL(req.url, baseUrl);
       const redirectUri = url.searchParams.get("redirect_uri");
       const state = url.searchParams.get("state");
+      const clientId = url.searchParams.get("client_id");
       const code = randomBytes(32).toString("hex");
 
-      // Store code temporarily (expires in 5 min)
       authCodes.set(code, { expiresAt: Date.now() + 300_000 });
       setTimeout(() => authCodes.delete(code), 300_000);
+
+      log("info", "oauth_authorize", { client_id: clientId, redirect_uri: redirectUri });
 
       if (redirectUri) {
         const redirect = new URL(redirectUri);
@@ -439,9 +535,6 @@ async function runHTTP(): Promise<void> {
         const params = new URLSearchParams(body);
         const grantType = params.get("grant_type");
 
-        console.error(`OAuth /token: grant_type=${grantType} client_id=${params.get("client_id")}`);
-
-
         let clientId = params.get("client_id");
         let clientSecret = params.get("client_secret");
 
@@ -454,6 +547,8 @@ async function runHTTP(): Promise<void> {
           clientSecret = clientSecret || secret;
         }
 
+        log("info", "oauth_token", { grant_type: grantType, client_id: clientId });
+
         // Validate client credentials
         const isStaticClient = clientId === AUTH_CLIENT_ID && clientSecret === AUTH_CLIENT_SECRET;
         const isRegisteredClient = clientId ? registeredClients.has(clientId) : false;
@@ -461,8 +556,8 @@ async function runHTTP(): Promise<void> {
         const isRegisteredValid = isRegisteredClient && (!clientSecret || clientSecret === registeredInfo?.clientSecret);
 
         if (grantType === "client_credentials") {
-          // client_credentials requires valid credentials
           if (isAuthEnabled() && !isStaticClient && !isRegisteredValid) {
+            log("warn", "oauth_token_rejected", { client_id: clientId, reason: "invalid_client" });
             res.writeHead(401, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "invalid_client" }));
             return;
@@ -470,10 +565,10 @@ async function runHTTP(): Promise<void> {
         }
 
         if (grantType === "client_credentials" || grantType === "authorization_code") {
-          // For authorization_code, verify the code (PKCE flow — client_secret not required)
           if (grantType === "authorization_code") {
             const code = params.get("code");
             if (!code || !authCodes.has(code)) {
+              log("warn", "oauth_token_rejected", { client_id: clientId, reason: "invalid_grant" });
               res.writeHead(400, { "Content-Type": "application/json" });
               res.end(JSON.stringify({ error: "invalid_grant" }));
               return;
@@ -483,6 +578,8 @@ async function runHTTP(): Promise<void> {
 
           const token = randomBytes(48).toString("hex");
           activeTokens.add(token);
+
+          log("info", "oauth_token_issued", { client_id: clientId, grant_type: grantType });
 
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({
@@ -505,13 +602,33 @@ async function runHTTP(): Promise<void> {
     // ── Health ─────────────────────────────────────────────────────────────
     if (req.method === "GET" && req.url === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", server: "grok-search-mcp-server" }));
+      res.end(JSON.stringify({ status: "ok", server: "grok-search-mcp-server", stats }));
+      return;
+    }
+
+    // ── Stats ──────────────────────────────────────────────────────────────
+    if (req.method === "GET" && req.url === "/stats") {
+      if (!checkBearer(req)) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "unauthorized" }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        ...stats,
+        uptime_seconds: Math.floor((Date.now() - new Date(stats.startedAt).getTime()) / 1000),
+        active_tokens: activeTokens.size,
+        registered_clients: registeredClients.size,
+      }));
       return;
     }
 
     // ── MCP (protected) ───────────────────────────────────────────────────
     if (req.method === "POST" && req.url === "/mcp") {
       if (!checkBearer(req)) {
+        log("warn", "mcp_unauthorized", {
+          ip: (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || req.socket.remoteAddress,
+        });
         res.writeHead(401, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           jsonrpc: "2.0",
@@ -535,6 +652,7 @@ async function runHTTP(): Promise<void> {
         await transport.handleRequest(req, res, parsed);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        log("error", "mcp_error", { error: msg });
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: msg }));
       }
@@ -546,12 +664,12 @@ async function runHTTP(): Promise<void> {
   });
 
   httpServer.listen(port, () => {
-    console.error(`grok-search-mcp-server running on http://0.0.0.0:${port}/mcp`);
-    if (isAuthEnabled()) {
-      console.error(`OAuth enabled (client_id: ${AUTH_CLIENT_ID.slice(0, 4)}...)`);
-    } else {
-      console.error("OAuth disabled (no AUTH_CLIENT_ID/AUTH_CLIENT_SECRET set)");
-    }
+    log("info", "server_started", {
+      transport: "http",
+      port,
+      base_url: configuredBaseUrl || "(auto-detect)",
+      auth: isAuthEnabled() ? "enabled" : "disabled",
+    });
   });
 }
 
