@@ -46,12 +46,18 @@ function logRequest(req: IncomingMessage, statusCode: number, durationMs: number
   });
 }
 
-// ─── Server ─────────────────────────────────────────────────────────────────
+// ─── Server Factory ─────────────────────────────────────────────────────────
+// Create a fresh McpServer per request to avoid "Already connected" errors
+// when concurrent requests arrive.
 
-const server = new McpServer({
-  name: "grok-search-mcp-server",
-  version: "1.0.0",
-});
+function createMcpServer(): McpServer {
+  const srv = new McpServer({
+    name: "grok-search-mcp-server",
+    version: "1.0.0",
+  });
+  registerTools(srv);
+  return srv;
+}
 
 // ─── OAuth State ────────────────────────────────────────────────────────────
 
@@ -199,6 +205,10 @@ function handleGrokResponse(
 
 import type { GrokContentBlock, GrokResponse } from "./types.js";
 
+// ─── Tool Registration ─────────────────────────────────────────────────────
+
+function registerTools(server: McpServer): void {
+
 // ─── Tool: grok_web_search ──────────────────────────────────────────────────
 
 server.registerTool(
@@ -343,11 +353,14 @@ IMPORTANT: You MUST preserve and cite the source URLs from the SOURCES block in 
   }
 );
 
+} // end registerTools
+
 // ─── HTTP Server ────────────────────────────────────────────────────────────
 
 async function runStdio(): Promise<void> {
+  const srv = createMcpServer();
   const transport = new StdioServerTransport();
-  await server.connect(transport);
+  await srv.connect(transport);
   log("info", "server_started", { transport: "stdio" });
 }
 
@@ -599,13 +612,14 @@ async function runHTTP(): Promise<void> {
         const body = await readBody(req);
         const parsed = JSON.parse(body);
 
+        const srv = createMcpServer();
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: undefined,
           enableJsonResponse: true,
         });
 
         res.on("close", () => transport.close());
-        await server.connect(transport);
+        await srv.connect(transport);
         await transport.handleRequest(req, res, parsed);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
