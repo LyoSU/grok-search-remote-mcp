@@ -4,6 +4,10 @@ services:
     restart: unless-stopped
     ports:
       - "3000"
+    labels:
+      - traefik.http.services.grok-search-mcp-svc.loadbalancer.server.port=3000
+      - traefik.http.routers.http-0-dos0kc8c80oksccso0sk4c00-grok-search-mcp.service=grok-search-mcp-svc
+      - traefik.http.routers.https-0-dos0kc8c80oksccso0sk4c00-grok-search-mcp.service=grok-search-mcp-svc
     environment:
       - XAI_API_KEY=${XAI_API_KEY}
       - GROK_MODEL=${GROK_MODEL:-grok-4.20-beta-latest-reasoning}
