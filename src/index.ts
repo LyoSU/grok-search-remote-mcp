@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { randomBytes } from "node:crypto";
 import { z } from "zod";
 import {
   getConfig,
@@ -22,6 +23,23 @@ const server = new McpServer({
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const SEARCH_SYSTEM_PROMPT = `You are a search assistant. Your job is to search the web or X (Twitter) for the user's query and return a comprehensive, well-structured answer with sources. Always cite URLs where possible. Be concise but thorough. Answer in the same language the user uses.`;
+
+// ─── OAuth ──────────────────────────────────────────────────────────────────
+
+const AUTH_CLIENT_ID = process.env.AUTH_CLIENT_ID || "";
+const AUTH_CLIENT_SECRET = process.env.AUTH_CLIENT_SECRET || "";
+const activeTokens = new Set<string>();
+
+function isAuthEnabled(): boolean {
+  return AUTH_CLIENT_ID.length > 0 && AUTH_CLIENT_SECRET.length > 0;
+}
+
+function checkBearer(req: IncomingMessage): boolean {
+  if (!isAuthEnabled()) return true;
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith("Bearer ")) return false;
+  return activeTokens.has(auth.slice(7));
+}
 
 // ─── Shared response handler ────────────────────────────────────────────────
 
@@ -322,6 +340,7 @@ async function runStdio(): Promise<void> {
 
 async function runHTTP(): Promise<void> {
   const port = parseInt(process.env.PORT || "3100", 10);
+  const baseUrl = process.env.BASE_URL || `http://localhost:${port}`;
 
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -334,13 +353,141 @@ async function runHTTP(): Promise<void> {
       return;
     }
 
+    // ── OAuth Discovery ───────────────────────────────────────────────────
+    if (req.method === "GET" && req.url === "/.well-known/oauth-authorization-server") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        issuer: baseUrl,
+        authorization_endpoint: `${baseUrl}/authorize`,
+        token_endpoint: `${baseUrl}/token`,
+        registration_endpoint: `${baseUrl}/register`,
+        response_types_supported: ["code"],
+        grant_types_supported: ["authorization_code", "client_credentials"],
+        token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic"],
+        code_challenge_methods_supported: ["S256"],
+      }));
+      return;
+    }
+
+    // ── OAuth Register (dynamic client registration) ──────────────────────
+    if (req.method === "POST" && req.url === "/register") {
+      try {
+        const body = await readBody(req);
+        const data = JSON.parse(body);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          client_id: AUTH_CLIENT_ID,
+          client_name: data.client_name || "mcp-client",
+          redirect_uris: data.redirect_uris || [],
+        }));
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid_request" }));
+      }
+      return;
+    }
+
+    // ── OAuth Authorize ───────────────────────────────────────────────────
+    if (req.url?.startsWith("/authorize")) {
+      const url = new URL(req.url, baseUrl);
+      const redirectUri = url.searchParams.get("redirect_uri");
+      const state = url.searchParams.get("state");
+      const code = randomBytes(32).toString("hex");
+
+      // Store code temporarily (expires in 5 min)
+      authCodes.set(code, { expiresAt: Date.now() + 300_000 });
+      setTimeout(() => authCodes.delete(code), 300_000);
+
+      if (redirectUri) {
+        const redirect = new URL(redirectUri);
+        redirect.searchParams.set("code", code);
+        if (state) redirect.searchParams.set("state", state);
+        res.writeHead(302, { Location: redirect.toString() });
+        res.end();
+      } else {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ code }));
+      }
+      return;
+    }
+
+    // ── OAuth Token ───────────────────────────────────────────────────────
+    if (req.method === "POST" && req.url === "/token") {
+      try {
+        const body = await readBody(req);
+        const params = new URLSearchParams(body);
+        const grantType = params.get("grant_type");
+
+        let clientId = params.get("client_id");
+        let clientSecret = params.get("client_secret");
+
+        // Support Basic auth header
+        const basicAuth = req.headers.authorization;
+        if (basicAuth?.startsWith("Basic ")) {
+          const decoded = Buffer.from(basicAuth.slice(6), "base64").toString();
+          const [id, secret] = decoded.split(":");
+          clientId = clientId || id;
+          clientSecret = clientSecret || secret;
+        }
+
+        if (isAuthEnabled() && (clientId !== AUTH_CLIENT_ID || clientSecret !== AUTH_CLIENT_SECRET)) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "invalid_client" }));
+          return;
+        }
+
+        if (grantType === "client_credentials" || grantType === "authorization_code") {
+          // For authorization_code, verify the code
+          if (grantType === "authorization_code") {
+            const code = params.get("code");
+            if (!code || !authCodes.has(code)) {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "invalid_grant" }));
+              return;
+            }
+            authCodes.delete(code);
+          }
+
+          const token = randomBytes(48).toString("hex");
+          activeTokens.add(token);
+
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            access_token: token,
+            token_type: "bearer",
+            expires_in: 86400,
+          }));
+          return;
+        }
+
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "unsupported_grant_type" }));
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid_request" }));
+      }
+      return;
+    }
+
+    // ── Health ─────────────────────────────────────────────────────────────
     if (req.method === "GET" && req.url === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "ok", server: "grok-search-mcp-server" }));
       return;
     }
 
+    // ── MCP (protected) ───────────────────────────────────────────────────
     if (req.method === "POST" && req.url === "/mcp") {
+      if (!checkBearer(req)) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          jsonrpc: "2.0",
+          error: { code: -32001, message: "Unauthorized. Provide a valid Bearer token." },
+          id: null,
+        }));
+        return;
+      }
+
       try {
         const body = await readBody(req);
         const parsed = JSON.parse(body);
@@ -367,8 +514,16 @@ async function runHTTP(): Promise<void> {
 
   httpServer.listen(port, () => {
     console.error(`grok-search-mcp-server running on http://0.0.0.0:${port}/mcp`);
+    if (isAuthEnabled()) {
+      console.error(`OAuth enabled (client_id: ${AUTH_CLIENT_ID.slice(0, 4)}...)`);
+    } else {
+      console.error("OAuth disabled (no AUTH_CLIENT_ID/AUTH_CLIENT_SECRET set)");
+    }
   });
 }
+
+// Authorization codes (short-lived)
+const authCodes = new Map<string, { expiresAt: number }>();
 
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
