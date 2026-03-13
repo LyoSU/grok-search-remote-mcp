@@ -383,9 +383,21 @@ async function runHTTP(): Promise<void> {
       try {
         const body = await readBody(req);
         const data = JSON.parse(body);
+        const newClientId = randomBytes(16).toString("hex");
+        const newClientSecret = randomBytes(32).toString("hex");
+
+        registeredClients.set(newClientId, {
+          clientSecret: newClientSecret,
+          clientName: data.client_name || "mcp-client",
+          redirectUris: data.redirect_uris || [],
+        });
+
+        console.error(`OAuth: registered client ${newClientId} (${data.client_name || "mcp-client"})`);
+
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
-          client_id: AUTH_CLIENT_ID,
+          client_id: newClientId,
+          client_secret: newClientSecret,
           client_name: data.client_name || "mcp-client",
           redirect_uris: data.redirect_uris || [],
         }));
@@ -427,6 +439,9 @@ async function runHTTP(): Promise<void> {
         const params = new URLSearchParams(body);
         const grantType = params.get("grant_type");
 
+        console.error(`OAuth /token: grant_type=${grantType} client_id=${params.get("client_id")}`);
+
+
         let clientId = params.get("client_id");
         let clientSecret = params.get("client_secret");
 
@@ -439,14 +454,23 @@ async function runHTTP(): Promise<void> {
           clientSecret = clientSecret || secret;
         }
 
-        if (isAuthEnabled() && (clientId !== AUTH_CLIENT_ID || clientSecret !== AUTH_CLIENT_SECRET)) {
-          res.writeHead(401, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "invalid_client" }));
-          return;
+        // Validate client credentials
+        const isStaticClient = clientId === AUTH_CLIENT_ID && clientSecret === AUTH_CLIENT_SECRET;
+        const isRegisteredClient = clientId ? registeredClients.has(clientId) : false;
+        const registeredInfo = clientId ? registeredClients.get(clientId) : undefined;
+        const isRegisteredValid = isRegisteredClient && (!clientSecret || clientSecret === registeredInfo?.clientSecret);
+
+        if (grantType === "client_credentials") {
+          // client_credentials requires valid credentials
+          if (isAuthEnabled() && !isStaticClient && !isRegisteredValid) {
+            res.writeHead(401, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "invalid_client" }));
+            return;
+          }
         }
 
         if (grantType === "client_credentials" || grantType === "authorization_code") {
-          // For authorization_code, verify the code
+          // For authorization_code, verify the code (PKCE flow — client_secret not required)
           if (grantType === "authorization_code") {
             const code = params.get("code");
             if (!code || !authCodes.has(code)) {
@@ -533,6 +557,9 @@ async function runHTTP(): Promise<void> {
 
 // Authorization codes (short-lived)
 const authCodes = new Map<string, { expiresAt: number }>();
+
+// Dynamically registered OAuth clients
+const registeredClients = new Map<string, { clientSecret: string; clientName: string; redirectUris: string[] }>();
 
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
