@@ -60,10 +60,21 @@ function handleGrokResponse(
     };
   }
 
-  const formatted = formatResultWithSources(parsed);
-  return {
-    content: [{ type: "text", text: formatted }],
-  };
+  const content: Array<{ type: "text"; text: string }> = [
+    { type: "text", text: parsed.text },
+  ];
+
+  if (parsed.citations.length > 0) {
+    const sourcesBlock = parsed.citations
+      .map((c, i) => `[${i + 1}] ${c.title || c.url}\n    ${c.url}`)
+      .join("\n");
+    content.push({
+      type: "text",
+      text: `SOURCES (you MUST include these URLs as citations in your response):\n${sourcesBlock}`,
+    });
+  }
+
+  return { content };
 }
 
 // ─── Tool: grok_web_search ──────────────────────────────────────────────────
@@ -85,7 +96,9 @@ Args:
   - raw_output (boolean, optional): Return raw API response instead of extracted text
 
 Returns:
-  Text with Grok's synthesized answer including inline citations and a Sources section listing all referenced URLs.`,
+  Two content blocks: (1) synthesized answer text, (2) SOURCES block with URLs.
+
+IMPORTANT: You MUST preserve and cite the source URLs from the SOURCES block in your response to the user. Always include clickable links.`,
     inputSchema: {
       query: z
         .string()
@@ -174,7 +187,9 @@ Args:
   - raw_output (boolean, optional): Return raw API response
 
 Returns:
-  Text with Grok's synthesized answer from X content, including inline citations and a Sources section.`,
+  Two content blocks: (1) synthesized answer text, (2) SOURCES block with URLs.
+
+IMPORTANT: You MUST preserve and cite the source URLs from the SOURCES block in your response to the user. Always include clickable links.`,
     inputSchema: {
       query: z
         .string()
@@ -257,7 +272,9 @@ Args:
   - raw_output (boolean, optional): Return raw API response
 
 Returns:
-  Text with Grok's synthesized answer from both web and X sources, including inline citations and a Sources section.`,
+  Two content blocks: (1) synthesized answer text, (2) SOURCES block with URLs.
+
+IMPORTANT: You MUST preserve and cite the source URLs from the SOURCES block in your response to the user. Always include clickable links.`,
     inputSchema: {
       query: z
         .string()
