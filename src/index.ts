@@ -340,7 +340,14 @@ async function runStdio(): Promise<void> {
 
 async function runHTTP(): Promise<void> {
   const port = parseInt(process.env.PORT || "3100", 10);
-  const baseUrl = process.env.BASE_URL || `http://localhost:${port}`;
+  const configuredBaseUrl = process.env.BASE_URL?.replace(/[?/]+$/, "") || "";
+
+  function getBaseUrl(req: IncomingMessage): string {
+    if (configuredBaseUrl) return configuredBaseUrl;
+    const host = req.headers["x-forwarded-host"] || req.headers.host || `localhost:${port}`;
+    const proto = req.headers["x-forwarded-proto"] || "http";
+    return `${proto}://${host}`;
+  }
 
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -352,6 +359,8 @@ async function runHTTP(): Promise<void> {
       res.end();
       return;
     }
+
+    const baseUrl = getBaseUrl(req);
 
     // ── OAuth Discovery ───────────────────────────────────────────────────
     if (req.method === "GET" && req.url === "/.well-known/oauth-authorization-server") {
