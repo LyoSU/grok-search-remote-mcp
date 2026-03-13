@@ -17,7 +17,8 @@ FROM node:22-alpine
 WORKDIR /app
 
 # Non-root user for security
-RUN addgroup -g 1001 -S mcp && \
+RUN apk add --no-cache wget && \
+    addgroup -g 1001 -S mcp && \
     adduser -S mcp -u 1001 -G mcp
 
 COPY package.json package-lock.json* ./
