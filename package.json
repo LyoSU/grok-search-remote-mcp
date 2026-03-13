@@ -1,0 +1,22 @@
+{
+  "name": "grok-search-remote-mcp",
+  "version": "1.0.0",
+  "description": "Remote MCP server (Streamable HTTP) that uses Grok API as a search engine",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "express": "^4.21.0",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.15.3",
+    "typescript": "^5.8.3"
+  }
+}
