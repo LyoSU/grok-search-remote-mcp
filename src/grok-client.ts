@@ -4,7 +4,9 @@ import type {
   GrokResponseInput,
   GrokTool,
   GrokContentBlock,
+  GrokAnnotation,
   SearchConfig,
+  ParsedGrokResult,
 } from "./types.js";
 
 const DEFAULT_MODEL = "grok-4.20-beta-latest-reasoning";
@@ -38,6 +40,7 @@ export async function callGrokResponses(
     input,
     tools,
     temperature: temperature ?? 0,
+    include: ["inline_citations"],
   };
 
   if (systemPrompt) {
@@ -63,31 +66,106 @@ export async function callGrokResponses(
   return (await response.json()) as GrokResponse;
 }
 
-export function extractTextFromOutput(output: GrokContentBlock[]): string {
-  const parts: string[] = [];
+/**
+ * Extract text + citations from Grok response.
+ *
+ * Grok Responses API returns:
+ *   output[N] = { type: "message", content: [{ type: "output_text", text: "...", annotations: [...] }] }
+ * or sometimes output_text blocks directly in the output array.
+ *
+ * With include: ["inline_citations"], the text itself contains [[1]](url) references.
+ * Annotations contain { type: "url_citation", url, title, start_index, end_index }.
+ * Top-level response.citations contains all encountered URLs.
+ */
+export function parseGrokOutput(response: GrokResponse): ParsedGrokResult {
+  const textParts: string[] = [];
+  const citationMap = new Map<string, string>(); // url -> title
 
-  for (const block of output) {
-    if (block.type === "message" && typeof block.content === "string") {
-      parts.push(block.content);
-    } else if (block.type === "text" && typeof block.text === "string") {
-      parts.push(block.text);
-    } else if (
-      block.type === "message" &&
-      Array.isArray(block.content)
-    ) {
+  function extractFromBlock(block: GrokContentBlock): void {
+    // Direct output_text block
+    if (block.type === "output_text" && typeof block.text === "string") {
+      textParts.push(block.text);
+      collectAnnotations(block.annotations);
+      return;
+    }
+
+    // Message wrapper with content array
+    if (block.type === "message" && Array.isArray(block.content)) {
       for (const inner of block.content as GrokContentBlock[]) {
         if (inner.type === "output_text" && typeof inner.text === "string") {
-          parts.push(inner.text);
+          textParts.push(inner.text);
+          collectAnnotations(inner.annotations);
         } else if (inner.type === "text" && typeof inner.text === "string") {
-          parts.push(inner.text);
+          textParts.push(inner.text);
+        }
+      }
+      return;
+    }
+
+    // Fallback: text blocks
+    if (block.type === "text" && typeof block.text === "string") {
+      textParts.push(block.text);
+    }
+  }
+
+  function collectAnnotations(annotations?: GrokAnnotation[]): void {
+    if (!annotations) return;
+    for (const ann of annotations) {
+      if (ann.type === "url_citation" && typeof ann.url === "string") {
+        const title = typeof ann.title === "string" ? ann.title : "";
+        // Keep first title we see for each URL
+        if (!citationMap.has(ann.url)) {
+          citationMap.set(ann.url, title);
         }
       }
     }
   }
 
-  return parts.join("\n\n");
+  for (const block of response.output) {
+    extractFromBlock(block);
+  }
+
+  // Also collect top-level citations (URLs agent visited)
+  if (Array.isArray(response.citations)) {
+    for (const url of response.citations) {
+      if (typeof url === "string" && !citationMap.has(url)) {
+        citationMap.set(url, "");
+      }
+    }
+  }
+
+  const citations = Array.from(citationMap.entries()).map(([url, title]) => ({
+    url,
+    title,
+  }));
+
+  return {
+    text: textParts.join("\n\n"),
+    citations,
+  };
 }
 
+/**
+ * Format the result as text with a sources section at the bottom.
+ */
+export function formatResultWithSources(result: ParsedGrokResult): string {
+  let output = result.text;
+
+  if (result.citations.length > 0) {
+    output += "\n\n---\n**Sources:**\n";
+    for (let i = 0; i < result.citations.length; i++) {
+      const c = result.citations[i];
+      const label = c.title || c.url;
+      output += `${i + 1}. ${label}\n   ${c.url}\n`;
+    }
+  }
+
+  return output;
+}
+
+/**
+ * Extract the full raw output for debugging/transparency.
+ */
 export function extractRawOutput(output: GrokContentBlock[]): string {
   return JSON.stringify(output, null, 2);
 }

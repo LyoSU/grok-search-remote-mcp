@@ -29,31 +29,48 @@ export interface GrokRequestBody {
   temperature?: number;
   max_output_tokens?: number;
   instructions?: string;
+  include?: string[];
+}
+
+export interface UrlCitation {
+  type: "url_citation";
+  url: string;
+  title?: string;
+  start_index?: number;
+  end_index?: number;
+}
+
+export interface GrokAnnotation {
+  type: string;
+  url?: string;
+  title?: string;
+  start_index?: number;
+  end_index?: number;
+  [key: string]: unknown;
+}
+
+export interface GrokOutputTextBlock {
+  type: "output_text";
+  text: string;
+  annotations?: GrokAnnotation[];
 }
 
 export interface GrokContentBlock {
   type: string;
   text?: string;
   name?: string;
-  content?: string;
+  content?: unknown;
   call_id?: string;
   id?: string;
   status?: string;
-  results?: GrokSearchResult[];
-  [key: string]: unknown;
-}
-
-export interface GrokSearchResult {
-  title?: string;
-  url?: string;
-  snippet?: string;
-  date?: string;
+  annotations?: GrokAnnotation[];
   [key: string]: unknown;
 }
 
 export interface GrokResponse {
   id: string;
   output: GrokContentBlock[];
+  citations?: string[];
   error?: {
     message: string;
     type: string;
@@ -65,4 +82,9 @@ export interface SearchConfig {
   apiKey: string;
   model: string;
   baseUrl: string;
+}
+
+export interface ParsedGrokResult {
+  text: string;
+  citations: Array<{ url: string; title: string }>;
 }
