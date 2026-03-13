@@ -40,7 +40,6 @@ export async function callGrokResponses(
     input,
     tools,
     temperature: temperature ?? 0,
-    include: ["inline_citations"],
   };
 
   if (systemPrompt) {
