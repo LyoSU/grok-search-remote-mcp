@@ -4,11 +4,14 @@ services:
     restart: unless-stopped
     ports:
       - "3000"
+    volumes:
+      - auth-data:/data
     environment:
       - XAI_API_KEY=${XAI_API_KEY}
       - GROK_MODEL=${GROK_MODEL:-grok-4.20-beta-latest-reasoning}
       - TRANSPORT=http
       - PORT=3000
+      - AUTH_STORE_PATH=/data/.auth-store.json
     networks:
       - coolify
     healthcheck:
@@ -17,6 +20,9 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+volumes:
+  auth-data:
 
 networks:
   coolify:

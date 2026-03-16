@@ -3,6 +3,9 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes, timingSafeEqual } from "node:crypto";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import {
   getConfig,
@@ -17,7 +20,7 @@ import type { GrokWebSearchTool, GrokXSearchTool, GrokTool } from "./types.js";
 const SEARCH_SYSTEM_PROMPT = `You are a search assistant. Your job is to search the web or X (Twitter) for the user's query and return a comprehensive, well-structured answer with sources. Always cite URLs where possible. Be concise but thorough. Answer in the same language the user uses.`;
 
 const MAX_BODY_SIZE = 1024 * 1024; // 1MB
-const TOKEN_TTL_MS = 86_400_000;   // 24h
+const TOKEN_TTL_MS = 365 * 86_400_000; // 1 year
 const MAX_REGISTERED_CLIENTS = 100;
 const CLEANUP_INTERVAL_MS = 300_000; // 5 min
 
@@ -78,6 +81,60 @@ const registeredClients = new Map<string, {
   createdAt: number;
 }>();
 
+// ─── Token & Client Persistence ─────────────────────────────────────────────
+// Persist tokens and registered clients to a JSON file so they survive restarts.
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const AUTH_STORE_PATH = process.env.AUTH_STORE_PATH || join(__dirname, "..", ".auth-store.json");
+
+interface AuthStore {
+  tokens: Array<[string, number]>;
+  clients: Array<[string, { clientSecret: string; clientName: string; redirectUris: string[]; createdAt: number }]>;
+}
+
+function loadAuthStore(): void {
+  try {
+    const raw = readFileSync(AUTH_STORE_PATH, "utf-8");
+    const data: AuthStore = JSON.parse(raw);
+    const now = Date.now();
+    let loaded = 0;
+    for (const [token, expiresAt] of data.tokens || []) {
+      if (expiresAt > now) {
+        activeTokens.set(token, expiresAt);
+        loaded++;
+      }
+    }
+    for (const [id, info] of data.clients || []) {
+      registeredClients.set(id, info);
+    }
+    if (loaded > 0 || (data.clients?.length ?? 0) > 0) {
+      log("info", "auth_store_loaded", {
+        tokens: loaded,
+        clients: data.clients?.length ?? 0,
+        path: AUTH_STORE_PATH,
+      });
+    }
+  } catch {
+    // File doesn't exist yet or is corrupted — start fresh
+  }
+}
+
+function saveAuthStore(): void {
+  try {
+    const data: AuthStore = {
+      tokens: [...activeTokens.entries()],
+      clients: [...registeredClients.entries()],
+    };
+    mkdirSync(dirname(AUTH_STORE_PATH), { recursive: true });
+    writeFileSync(AUTH_STORE_PATH, JSON.stringify(data, null, 2), "utf-8");
+  } catch (err) {
+    log("warn", "auth_store_save_failed", { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+// Load persisted auth state on startup
+loadAuthStore();
+
 function isAuthEnabled(): boolean {
   return AUTH_CLIENT_ID.length > 0 && AUTH_CLIENT_SECRET.length > 0;
 }
@@ -121,6 +178,7 @@ setInterval(() => {
       active_tokens: activeTokens.size,
       registered_clients: registeredClients.size,
     });
+    saveAuthStore();
   }
 }, CLEANUP_INTERVAL_MS);
 
@@ -442,6 +500,7 @@ async function runHTTP(): Promise<void> {
         });
 
         log("info", "oauth_register", { client_id: newClientId, client_name: clientName });
+        saveAuthStore();
 
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
@@ -550,6 +609,7 @@ async function runHTTP(): Promise<void> {
 
           const token = randomBytes(48).toString("hex");
           activeTokens.set(token, Date.now() + TOKEN_TTL_MS);
+          saveAuthStore();
 
           log("info", "oauth_token_issued", { client_id: clientId, grant_type: grantType });
 

@@ -25,6 +25,9 @@ RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --from=builder /app/dist ./dist
 
+# Persistent auth store directory
+RUN mkdir -p /data && chown mcp:mcp /data
+
 USER mcp
 
 ENV TRANSPORT=http
