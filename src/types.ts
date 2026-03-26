@@ -30,6 +30,7 @@ export interface GrokRequestBody {
   max_output_tokens?: number;
   instructions?: string;
   include?: string[];
+  reasoning?: { effort: "low" | "medium" | "high" | "xhigh" };
 }
 
 export interface UrlCitation {

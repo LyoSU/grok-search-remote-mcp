@@ -10,6 +10,7 @@ import type {
 } from "./types.js";
 
 const DEFAULT_MODEL = "grok-4.20-beta-latest-reasoning";
+const MULTI_AGENT_MODEL = "grok-4.20-multi-agent";
 const DEFAULT_BASE_URL = "https://api.x.ai/v1";
 
 export function getConfig(): SearchConfig {
@@ -26,21 +27,42 @@ export function getConfig(): SearchConfig {
   };
 }
 
+export interface CallOptions {
+  systemPrompt?: string;
+  temperature?: number;
+  signal?: AbortSignal;
+  /** Use multi-agent model. "quick" = 4 agents, "deep" = 16 agents. */
+  multiAgent?: "quick" | "deep";
+}
+
+export function getMultiAgentModel(): string {
+  return process.env.GROK_MULTI_AGENT_MODEL || MULTI_AGENT_MODEL;
+}
+
 export async function callGrokResponses(
   config: SearchConfig,
   query: string,
   tools: GrokTool[],
-  systemPrompt?: string,
-  temperature?: number
+  opts: CallOptions = {},
 ): Promise<GrokResponse> {
+  const { systemPrompt, temperature, signal, multiAgent } = opts;
   const input: GrokResponseInput[] = [{ role: "user", content: query }];
 
+  const model = multiAgent ? getMultiAgentModel() : config.model;
+
   const body: GrokRequestBody = {
-    model: config.model,
+    model,
     input,
     tools,
-    temperature: temperature ?? 0,
   };
+
+  if (multiAgent) {
+    // "low"/"medium" = 4 agents, "high"/"xhigh" = 16 agents
+    body.reasoning = { effort: multiAgent === "deep" ? "high" : "low" };
+    // Multi-agent model manages its own temperature; only set for single-agent
+  } else {
+    body.temperature = temperature ?? 0;
+  }
 
   if (systemPrompt) {
     body.instructions = systemPrompt;
@@ -53,6 +75,7 @@ export async function callGrokResponses(
       Authorization: `Bearer ${config.apiKey}`,
     },
     body: JSON.stringify(body),
+    signal,
   });
 
   if (!response.ok) {
@@ -142,24 +165,6 @@ export function parseGrokOutput(response: GrokResponse): ParsedGrokResult {
     text: textParts.join("\n\n"),
     citations,
   };
-}
-
-/**
- * Format the result as text with a sources section at the bottom.
- */
-export function formatResultWithSources(result: ParsedGrokResult): string {
-  let output = result.text;
-
-  if (result.citations.length > 0) {
-    output += "\n\n---\n**Sources:**\n";
-    for (let i = 0; i < result.citations.length; i++) {
-      const c = result.citations[i];
-      const label = c.title || c.url;
-      output += `${i + 1}. ${label}\n   ${c.url}\n`;
-    }
-  }
-
-  return output;
 }
 
 /**

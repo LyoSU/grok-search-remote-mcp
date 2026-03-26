@@ -1,6 +1,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import type { ServerRequest, ServerNotification } from "@modelcontextprotocol/sdk/types.js";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
@@ -191,6 +193,69 @@ const stats = {
   startedAt: new Date().toISOString(),
 };
 
+// ─── Progress Notifications ─────────────────────────────────────────────────
+// Sends periodic progress notifications to keep the MCP connection alive
+// while waiting for slow xAI API responses (prevents client-side timeouts).
+
+const PROGRESS_INTERVAL_MS = 5_000; // Send heartbeat every 5 seconds
+
+interface ProgressSender {
+  stop(): void;
+}
+
+function startProgressNotifications(
+  extra: RequestHandlerExtra<ServerRequest, ServerNotification>,
+  toolName: string,
+  deepResearch = false,
+): ProgressSender {
+  const progressToken = extra._meta?.progressToken;
+  // If client didn't request progress, nothing to do
+  if (!progressToken) {
+    return { stop() {} };
+  }
+
+  let tick = 0;
+  const messages = deepResearch
+    ? [
+        `Deep research with 4 agents: ${toolName}...`,
+        "Multi-agent team is researching in parallel...",
+        "Agents are synthesizing findings...",
+        "Still working, multi-agent takes longer...",
+        "Almost there...",
+      ]
+    : [
+        `Searching with ${toolName}...`,
+        "Waiting for Grok API response...",
+        "Still processing, please wait...",
+        "Grok is thinking...",
+        "Almost there...",
+      ];
+
+  const interval = setInterval(async () => {
+    tick++;
+    const message = messages[Math.min(tick - 1, messages.length - 1)];
+    try {
+      await extra.sendNotification({
+        method: "notifications/progress" as const,
+        params: {
+          progressToken,
+          progress: tick,
+          total: tick + 1, // indeterminate: total always ahead
+          message,
+        },
+      });
+    } catch {
+      // Client may not support progress — ignore silently
+    }
+  }, PROGRESS_INTERVAL_MS);
+
+  return {
+    stop() {
+      clearInterval(interval);
+    },
+  };
+}
+
 // ─── Shared response handler ────────────────────────────────────────────────
 
 function handleGrokResponse(
@@ -289,6 +354,8 @@ IMPORTANT: You MUST preserve and cite the source URLs from the SOURCES block in 
         .describe("Exclude these domains from search (max 5)"),
       look_back_days: z.number().int().positive().optional()
         .describe("Only return results from the last N days"),
+      deep_research: z.boolean().default(false)
+        .describe("Use multi-agent model (4 parallel agents) for deeper, more comprehensive research. Slower but better for complex queries."),
       system_prompt: z.string().max(4000).optional()
         .describe("Override the default system prompt for Grok"),
       raw_output: z.boolean().default(false)
@@ -296,12 +363,13 @@ IMPORTANT: You MUST preserve and cite the source URLs from the SOURCES block in 
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
-  async (params) => {
+  async (params, extra) => {
     const startTime = Date.now();
     stats.totalRequests++;
     stats.toolCalls.grok_web_search++;
-    log("info", "tool_call", { tool: "grok_web_search", query: params.query });
+    log("info", "tool_call", { tool: "grok_web_search", query: params.query, deep_research: params.deep_research });
 
+    const progress = startProgressNotifications(extra, "grok_web_search", params.deep_research);
     try {
       const config = getConfig();
       const webSearchTool: GrokWebSearchTool = { type: "web_search" };
@@ -309,13 +377,19 @@ IMPORTANT: You MUST preserve and cite the source URLs from the SOURCES block in 
       if (params.excluded_domains?.length) webSearchTool.excludedDomains = params.excluded_domains;
       if (params.look_back_days) webSearchTool.lookBackDays = params.look_back_days;
 
-      const response = await callGrokResponses(config, params.query, [webSearchTool], params.system_prompt || SEARCH_SYSTEM_PROMPT);
+      const response = await callGrokResponses(config, params.query, [webSearchTool], {
+        systemPrompt: params.system_prompt || SEARCH_SYSTEM_PROMPT,
+        signal: extra.signal,
+        multiAgent: params.deep_research ? "quick" : undefined,
+      });
       return handleGrokResponse(response, params.raw_output, "grok_web_search", params.query, startTime);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       stats.errors++;
       log("error", "tool_call_error", { tool: "grok_web_search", query: params.query, error: msg, duration_ms: Date.now() - startTime });
       return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+    } finally {
+      progress.stop();
     }
   }
 );
@@ -340,17 +414,20 @@ IMPORTANT: You MUST preserve and cite the source URLs from the SOURCES block in 
       blocked_handles: z.array(z.string()).optional().describe("Exclude posts from these X handles"),
       from_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Start date (YYYY-MM-DD)"),
       to_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("End date (YYYY-MM-DD)"),
+      deep_research: z.boolean().default(false)
+        .describe("Use multi-agent model (4 parallel agents) for deeper, more comprehensive research. Slower but better for complex queries."),
       system_prompt: z.string().max(4000).optional().describe("Override the default system prompt"),
       raw_output: z.boolean().default(false).describe("Return raw API response blocks"),
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
-  async (params) => {
+  async (params, extra) => {
     const startTime = Date.now();
     stats.totalRequests++;
     stats.toolCalls.grok_x_search++;
-    log("info", "tool_call", { tool: "grok_x_search", query: params.query });
+    log("info", "tool_call", { tool: "grok_x_search", query: params.query, deep_research: params.deep_research });
 
+    const progress = startProgressNotifications(extra, "grok_x_search", params.deep_research);
     try {
       const config = getConfig();
       const xSearchTool: GrokXSearchTool = { type: "x_search" };
@@ -359,13 +436,19 @@ IMPORTANT: You MUST preserve and cite the source URLs from the SOURCES block in 
       if (params.from_date) xSearchTool.from_date = params.from_date;
       if (params.to_date) xSearchTool.to_date = params.to_date;
 
-      const response = await callGrokResponses(config, params.query, [xSearchTool], params.system_prompt || SEARCH_SYSTEM_PROMPT);
+      const response = await callGrokResponses(config, params.query, [xSearchTool], {
+        systemPrompt: params.system_prompt || SEARCH_SYSTEM_PROMPT,
+        signal: extra.signal,
+        multiAgent: params.deep_research ? "quick" : undefined,
+      });
       return handleGrokResponse(response, params.raw_output, "grok_x_search", params.query, startTime);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       stats.errors++;
       log("error", "tool_call_error", { tool: "grok_x_search", query: params.query, error: msg, duration_ms: Date.now() - startTime });
       return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+    } finally {
+      progress.stop();
     }
   }
 );
@@ -386,27 +469,36 @@ Returns:
 IMPORTANT: You MUST preserve and cite the source URLs from the SOURCES block in your response to the user. Always include clickable links.`,
     inputSchema: {
       query: z.string().min(1).max(2000).describe("The search query"),
+      deep_research: z.boolean().default(false)
+        .describe("Use multi-agent model (4 parallel agents) for deeper, more comprehensive research. Slower but better for complex queries."),
       system_prompt: z.string().max(4000).optional().describe("Override the default system prompt"),
       raw_output: z.boolean().default(false).describe("Return raw API response blocks"),
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
-  async (params) => {
+  async (params, extra) => {
     const startTime = Date.now();
     stats.totalRequests++;
     stats.toolCalls.grok_search++;
-    log("info", "tool_call", { tool: "grok_search", query: params.query });
+    log("info", "tool_call", { tool: "grok_search", query: params.query, deep_research: params.deep_research });
 
+    const progress = startProgressNotifications(extra, "grok_search", params.deep_research);
     try {
       const config = getConfig();
       const tools: GrokTool[] = [{ type: "web_search" }, { type: "x_search" }];
-      const response = await callGrokResponses(config, params.query, tools, params.system_prompt || SEARCH_SYSTEM_PROMPT);
+      const response = await callGrokResponses(config, params.query, tools, {
+        systemPrompt: params.system_prompt || SEARCH_SYSTEM_PROMPT,
+        signal: extra.signal,
+        multiAgent: params.deep_research ? "quick" : undefined,
+      });
       return handleGrokResponse(response, params.raw_output, "grok_search", params.query, startTime);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       stats.errors++;
       log("error", "tool_call_error", { tool: "grok_search", query: params.query, error: msg, duration_ms: Date.now() - startTime });
       return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+    } finally {
+      progress.stop();
     }
   }
 );
