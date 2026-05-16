@@ -28,7 +28,7 @@ npm run build
 | Змінна | Обов'язкова | Опис |
 |---|---|---|
 | `XAI_API_KEY` | ✅ | API ключ з https://console.x.ai/ |
-| `GROK_MODEL` | ❌ | Модель (за замовчуванням `grok-4.20-beta-latest-reasoning`) |
+| `GROK_MODEL` | ❌ | Модель (за замовчуванням `grok-4.3-latest`) |
 | `XAI_BASE_URL` | ❌ | Base URL API (за замовчуванням `https://api.x.ai/v1`) |
 | `TRANSPORT` | ❌ | `stdio` (за замовчуванням) або `http` для remote MCP |
 | `PORT` | ❌ | Порт для HTTP режиму (за замовчуванням `3100`) |
@@ -124,7 +124,7 @@ curl http://localhost:3100/health
 
 ### Зміна моделі
 
-За замовчуванням використовується `grok-4.20-beta-latest-reasoning`. Можна змінити через `GROK_MODEL`:
+За замовчуванням використовується `grok-4.3-latest`. Можна змінити через `GROK_MODEL`:
 
 ```json
 {
@@ -135,7 +135,7 @@ curl http://localhost:3100/health
 }
 ```
 
-Доступні моделі з підтримкою Responses API: `grok-4.20-beta-latest-reasoning`, `grok-4`, `grok-4-fast`, `grok-4-1-fast`, `grok-3`.
+Доступні моделі з підтримкою Responses API: `grok-4.3-latest`, `grok-4`, `grok-4-fast`, `grok-4-1-fast`, `grok-3`.
 
 ## Приклади використання
 

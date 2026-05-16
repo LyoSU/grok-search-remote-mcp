@@ -9,7 +9,7 @@ import type {
   ParsedGrokResult,
 } from "./types.js";
 
-const DEFAULT_MODEL = "grok-4.20-beta-latest-reasoning";
+const DEFAULT_MODEL = "grok-4.3-latest";
 const MULTI_AGENT_MODEL = "grok-4.20-multi-agent";
 const DEFAULT_BASE_URL = "https://api.x.ai/v1";
 

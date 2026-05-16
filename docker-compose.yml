@@ -8,7 +8,7 @@ services:
       - auth-data:/data
     environment:
       - XAI_API_KEY=${XAI_API_KEY}
-      - GROK_MODEL=${GROK_MODEL:-grok-4.20-beta-latest-reasoning}
+      - GROK_MODEL=${GROK_MODEL:-grok-4.3-latest}
       - TRANSPORT=http
       - PORT=3000
       - AUTH_STORE_PATH=/data/.auth-store.json
