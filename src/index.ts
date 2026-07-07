@@ -823,9 +823,11 @@ async function runHTTP(): Promise<void> {
         }
       }
 
-      if (codeChallenge && codeChallengeMethod && codeChallengeMethod !== "S256") {
+      // PKCE is mandatory (OAuth 2.1 / MCP): the authorization request must
+      // carry an S256 code_challenge, otherwise a stolen code could be redeemed.
+      if (!codeChallenge || codeChallengeMethod !== "S256") {
         res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "invalid_request", error_description: "only S256 PKCE is supported" }));
+        res.end(JSON.stringify({ error: "invalid_request", error_description: "PKCE required: send code_challenge with code_challenge_method=S256" }));
         return;
       }
 
@@ -945,20 +947,19 @@ async function runHTTP(): Promise<void> {
             return;
           }
 
-          // Enforce PKCE when the authorization request used it.
-          if (entry.codeChallenge) {
-            const verifier = params.get("code_verifier") || "";
-            if (!verifier || !verifyPkceS256(verifier, entry.codeChallenge)) {
-              log("warn", "oauth_token_rejected", { client_id: clientId, reason: "pkce_failed" });
-              res.writeHead(400, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ error: "invalid_grant" }));
-              return;
-            }
+          // PKCE is mandatory: every code carries an S256 challenge, verify it.
+          const verifier = params.get("code_verifier") || "";
+          if (!entry.codeChallenge || !verifier || !verifyPkceS256(verifier, entry.codeChallenge)) {
+            log("warn", "oauth_token_rejected", { client_id: clientId, reason: "pkce_failed" });
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "invalid_grant" }));
+            return;
           }
 
-          // Authenticate confidential (registered) clients by their secret.
-          if (registeredInfo && registeredInfo.clientSecret && clientSecret
-            && !safeEqual(clientSecret, registeredInfo.clientSecret)) {
+          // A registered confidential client MUST authenticate with its secret
+          // (present AND matching) — an absent secret is not an escape hatch.
+          if (registeredInfo?.clientSecret
+            && (!clientSecret || !safeEqual(clientSecret, registeredInfo.clientSecret))) {
             log("warn", "oauth_token_rejected", { client_id: clientId, reason: "invalid_client" });
             res.writeHead(401, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "invalid_client" }));
@@ -980,8 +981,28 @@ async function runHTTP(): Promise<void> {
             res.end(JSON.stringify({ error: "invalid_grant" }));
             return;
           }
+          // The refresh token is bound to the client it was issued to.
+          if (clientId && info.clientId && clientId !== info.clientId) {
+            log("warn", "oauth_token_rejected", { client_id: clientId, reason: "client_mismatch" });
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "invalid_grant" }));
+            return;
+          }
+
+          // Confidential clients (static or a registered client with a secret)
+          // MUST authenticate to rotate a refresh token.
+          const boundIsStatic = !!info.clientId && !!AUTH_CLIENT_ID && safeEqual(info.clientId, AUTH_CLIENT_ID);
+          const boundRegistered = info.clientId ? registeredClients.get(info.clientId) : undefined;
+          const requiredSecret = boundIsStatic ? AUTH_CLIENT_SECRET : boundRegistered?.clientSecret;
+          if (requiredSecret && (!clientSecret || !safeEqual(clientSecret, requiredSecret))) {
+            log("warn", "oauth_token_rejected", { client_id: info.clientId, reason: "invalid_client" });
+            res.writeHead(401, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "invalid_client" }));
+            return;
+          }
+
           refreshTokens.delete(rt); // rotation: old refresh token is invalidated
-          clientId = clientId || info.clientId;
+          clientId = info.clientId; // new tokens stay bound to the original client
           sendTokens(true);
           return;
         }
