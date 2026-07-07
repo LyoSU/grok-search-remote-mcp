@@ -4,7 +4,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type { ServerRequest, ServerNotification } from "@modelcontextprotocol/sdk/types.js";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes, timingSafeEqual, createHash } from "node:crypto";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,7 +22,9 @@ import type { GrokWebSearchTool, GrokXSearchTool, GrokTool } from "./types.js";
 const SEARCH_SYSTEM_PROMPT = `You are a search assistant. Your job is to search the web or X (Twitter) for the user's query and return a comprehensive, well-structured answer with sources. Always cite URLs where possible. Be concise but thorough. Answer in the same language the user uses.`;
 
 const MAX_BODY_SIZE = 1024 * 1024; // 1MB
-const TOKEN_TTL_MS = 365 * 86_400_000; // 1 year
+const ACCESS_TOKEN_TTL_MS = 60 * 60_000; // 1 hour (short-lived, per OAuth 2.1)
+const REFRESH_TOKEN_TTL_MS = 30 * 86_400_000; // 30 days
+const AUTH_CODE_TTL_MS = 5 * 60_000; // 5 minutes
 const MAX_REGISTERED_CLIENTS = 100;
 const CLEANUP_INTERVAL_MS = 300_000; // 5 min
 
@@ -69,11 +71,24 @@ function createMcpServer(): McpServer {
 const AUTH_CLIENT_ID = process.env.AUTH_CLIENT_ID || "";
 const AUTH_CLIENT_SECRET = process.env.AUTH_CLIENT_SECRET || "";
 
-// Tokens with expiry
+// The shared secret that authenticates the resource owner at /authorize.
+// Defaults to AUTH_CLIENT_SECRET so no extra config is required.
+const AUTH_ACCESS_PASSWORD = process.env.AUTH_ACCESS_PASSWORD || AUTH_CLIENT_SECRET;
+
+// Access tokens with expiry (short-lived)
 const activeTokens = new Map<string, number>(); // token -> expiresAt
 
-// Authorization codes (short-lived)
-const authCodes = new Map<string, { expiresAt: number }>();
+// Refresh tokens with expiry, bound to the client they were issued to
+const refreshTokens = new Map<string, { expiresAt: number; clientId: string }>();
+
+// Authorization codes (short-lived), bound to client + PKCE challenge
+const authCodes = new Map<string, {
+  expiresAt: number;
+  clientId: string;
+  redirectUri: string | null;
+  codeChallenge: string; // "" when the client did not use PKCE
+  resource: string | null;
+}>();
 
 // Dynamically registered OAuth clients
 const registeredClients = new Map<string, {
@@ -91,6 +106,7 @@ const AUTH_STORE_PATH = process.env.AUTH_STORE_PATH || join(__dirname, "..", ".a
 
 interface AuthStore {
   tokens: Array<[string, number]>;
+  refreshTokens?: Array<[string, { expiresAt: number; clientId: string }]>;
   clients: Array<[string, { clientSecret: string; clientName: string; redirectUris: string[]; createdAt: number }]>;
 }
 
@@ -99,19 +115,31 @@ function loadAuthStore(): void {
     const raw = readFileSync(AUTH_STORE_PATH, "utf-8");
     const data: AuthStore = JSON.parse(raw);
     const now = Date.now();
+    // Reject any persisted access token whose remaining lifetime exceeds the
+    // current short-lived ceiling — this drops long tokens minted by earlier
+    // versions before access tokens were made short-lived.
+    const maxRemaining = ACCESS_TOKEN_TTL_MS + 60_000;
     let loaded = 0;
+    let dropped = 0;
     for (const [token, expiresAt] of data.tokens || []) {
-      if (expiresAt > now) {
+      if (expiresAt > now && expiresAt - now <= maxRemaining) {
         activeTokens.set(token, expiresAt);
         loaded++;
+      } else if (expiresAt > now) {
+        dropped++;
       }
+    }
+    for (const [rt, info] of data.refreshTokens || []) {
+      if (info.expiresAt > now) refreshTokens.set(rt, info);
     }
     for (const [id, info] of data.clients || []) {
       registeredClients.set(id, info);
     }
-    if (loaded > 0 || (data.clients?.length ?? 0) > 0) {
+    if (loaded > 0 || dropped > 0 || (data.clients?.length ?? 0) > 0) {
       log("info", "auth_store_loaded", {
         tokens: loaded,
+        dropped_legacy_tokens: dropped,
+        refresh_tokens: refreshTokens.size,
         clients: data.clients?.length ?? 0,
         path: AUTH_STORE_PATH,
       });
@@ -125,6 +153,7 @@ function saveAuthStore(): void {
   try {
     const data: AuthStore = {
       tokens: [...activeTokens.entries()],
+      refreshTokens: [...refreshTokens.entries()],
       clients: [...registeredClients.entries()],
     };
     mkdirSync(dirname(AUTH_STORE_PATH), { recursive: true });
@@ -165,6 +194,7 @@ setInterval(() => {
   const now = Date.now();
   let expiredTokens = 0;
   let expiredCodes = 0;
+  let expiredRefresh = 0;
 
   for (const [token, expiresAt] of activeTokens) {
     if (now > expiresAt) { activeTokens.delete(token); expiredTokens++; }
@@ -172,17 +202,112 @@ setInterval(() => {
   for (const [code, { expiresAt }] of authCodes) {
     if (now > expiresAt) { authCodes.delete(code); expiredCodes++; }
   }
+  for (const [rt, { expiresAt }] of refreshTokens) {
+    if (now > expiresAt) { refreshTokens.delete(rt); expiredRefresh++; }
+  }
 
-  if (expiredTokens > 0 || expiredCodes > 0) {
+  if (expiredTokens > 0 || expiredCodes > 0 || expiredRefresh > 0) {
     log("info", "cleanup", {
       expired_tokens: expiredTokens,
       expired_codes: expiredCodes,
+      expired_refresh: expiredRefresh,
       active_tokens: activeTokens.size,
       registered_clients: registeredClients.size,
     });
     saveAuthStore();
   }
 }, CLEANUP_INTERVAL_MS);
+
+// ─── OAuth Helpers ────────────────────────────────────────────────────────────
+
+// Verify a PKCE code_verifier against a stored S256 code_challenge.
+function verifyPkceS256(verifier: string, challenge: string): boolean {
+  const hash = createHash("sha256").update(verifier).digest("base64url");
+  if (hash.length !== challenge.length) return false;
+  return timingSafeEqual(Buffer.from(hash), Buffer.from(challenge));
+}
+
+// Escape untrusted values before reflecting them into the consent HTML page.
+function htmlEscape(s: string): string {
+  return s.replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string));
+}
+
+// A redirect_uri is only acceptable if it is HTTPS or a loopback address,
+// preventing open-redirect abuse of the authorization endpoint.
+function isSafeRedirectUri(uri: string): boolean {
+  try {
+    const u = new URL(uri);
+    if (u.protocol === "https:") return true;
+    return (u.protocol === "http:") && (u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "[::1]");
+  } catch {
+    return false;
+  }
+}
+
+// Issue a short-lived access token and persist it.
+function issueAccessToken(): { token: string; expiresIn: number } {
+  const token = randomBytes(48).toString("hex");
+  activeTokens.set(token, Date.now() + ACCESS_TOKEN_TTL_MS);
+  return { token, expiresIn: Math.floor(ACCESS_TOKEN_TTL_MS / 1000) };
+}
+
+// Issue a rotating refresh token bound to a client.
+function issueRefreshToken(clientId: string): string {
+  const rt = randomBytes(48).toString("hex");
+  refreshTokens.set(rt, { expiresAt: Date.now() + REFRESH_TOKEN_TTL_MS, clientId });
+  return rt;
+}
+
+// Minimal, self-contained consent/login page for the authorization endpoint.
+function renderConsentPage(fields: Record<string, string>, error?: string): string {
+  const hidden = Object.entries(fields)
+    .filter(([, v]) => v)
+    .map(([k, v]) => `<input type="hidden" name="${htmlEscape(k)}" value="${htmlEscape(v)}">`)
+    .join("\n      ");
+  const errorBlock = error ? `<p class="err">${htmlEscape(error)}</p>` : "";
+  return `<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Authorize · Grok Search MCP</title>
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center;
+      font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: #0b0d12; color: #e7e9ee; }
+    .card { width: min(92vw, 380px); padding: 32px; border-radius: 16px;
+      background: #151922; border: 1px solid #232937; box-shadow: 0 20px 60px rgba(0,0,0,.4); }
+    h1 { margin: 0 0 4px; font-size: 20px; }
+    p.sub { margin: 0 0 24px; color: #97a0b3; font-size: 13px; }
+    label { display: block; margin: 0 0 8px; font-size: 13px; color: #b7bfce; }
+    input[type=password] { width: 100%; padding: 12px 14px; border-radius: 10px;
+      border: 1px solid #2b3242; background: #0f131b; color: #e7e9ee; font-size: 15px; }
+    input[type=password]:focus { outline: none; border-color: #4c8dff; }
+    button { width: 100%; margin-top: 18px; padding: 12px; border: 0; border-radius: 10px;
+      background: #4c8dff; color: #fff; font-size: 15px; font-weight: 600; cursor: pointer; }
+    button:hover { background: #3a7bf0; }
+    .err { margin: 0 0 16px; padding: 10px 12px; border-radius: 8px;
+      background: #3a1720; border: 1px solid #6b2434; color: #ff9db0; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>Grok Search MCP</h1>
+    <p class="sub">Enter the access secret to authorize this client.</p>
+    ${errorBlock}
+    <form method="POST" action="/authorize">
+      ${hidden}
+      <label for="password">Access secret</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" autofocus required>
+      <button type="submit">Authorize</button>
+    </form>
+  </main>
+</body>
+</html>`;
+}
 
 // ─── Stats ──────────────────────────────────────────────────────────────────
 
@@ -526,6 +651,24 @@ async function runHTTP(): Promise<void> {
     return `${proto}://${host}`;
   }
 
+  // Extra origins allowed to talk to the MCP endpoint from a browser.
+  const extraAllowedOrigins = new Set(
+    (process.env.ALLOWED_ORIGINS || "").split(",").map((s) => s.trim()).filter(Boolean),
+  );
+
+  // DNS-rebinding protection: a browser Origin must match our own host or an
+  // explicit allowlist. Non-browser clients send no Origin and are allowed.
+  function isOriginAllowed(req: IncomingMessage, baseUrl: string): boolean {
+    const origin = req.headers.origin;
+    if (!origin) return true;
+    if (extraAllowedOrigins.has(origin)) return true;
+    try {
+      return new URL(origin).host === new URL(baseUrl).host;
+    } catch {
+      return false;
+    }
+  }
+
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const reqStart = Date.now();
 
@@ -575,8 +718,8 @@ async function runHTTP(): Promise<void> {
         token_endpoint: `${baseUrl}/token`,
         registration_endpoint: `${baseUrl}/register`,
         response_types_supported: ["code"],
-        grant_types_supported: ["authorization_code", "client_credentials"],
-        token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic"],
+        grant_types_supported: ["authorization_code", "client_credentials", "refresh_token"],
+        token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic", "none"],
         code_challenge_methods_supported: ["S256"],
       }));
       return;
@@ -627,30 +770,90 @@ async function runHTTP(): Promise<void> {
     }
 
     // ── OAuth Authorize ───────────────────────────────────────────────────
-    if (req.url?.startsWith("/authorize")) {
-      const url = new URL(req.url, baseUrl);
-      const redirectUri = url.searchParams.get("redirect_uri");
-      const state = url.searchParams.get("state");
-      const clientId = url.searchParams.get("client_id");
+    // GET renders the consent page; POST authenticates the resource owner via
+    // the shared access secret and only then issues an authorization code.
+    if (req.url?.split("?")[0] === "/authorize" && (req.method === "GET" || req.method === "POST")) {
+      // Collect parameters from either the query string (GET) or the form body (POST).
+      let src: URLSearchParams;
+      if (req.method === "POST") {
+        src = new URLSearchParams(await readBody(req));
+      } else {
+        src = new URL(req.url, baseUrl).searchParams;
+      }
 
-      // Validate redirect_uri against registered client
-      if (redirectUri && clientId) {
+      const responseType = src.get("response_type") || "code";
+      const clientId = src.get("client_id") || "";
+      const redirectUri = src.get("redirect_uri");
+      const state = src.get("state");
+      const codeChallenge = src.get("code_challenge") || "";
+      const codeChallengeMethod = src.get("code_challenge_method") || "";
+      const resource = src.get("resource");
+      const scope = src.get("scope") || "";
+
+      const fields: Record<string, string> = {
+        response_type: responseType,
+        client_id: clientId,
+        redirect_uri: redirectUri || "",
+        state: state || "",
+        code_challenge: codeChallenge,
+        code_challenge_method: codeChallengeMethod,
+        resource: resource || "",
+        scope,
+      };
+
+      if (responseType !== "code") {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "unsupported_response_type" }));
+        return;
+      }
+
+      // Reject unusable redirect targets up front (open-redirect protection).
+      if (redirectUri) {
+        if (!isSafeRedirectUri(redirectUri)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "invalid_redirect_uri" }));
+          return;
+        }
         const client = registeredClients.get(clientId);
-        const isStaticClient = clientId === AUTH_CLIENT_ID;
-        if (!isStaticClient && client && client.redirectUris.length > 0) {
-          if (!client.redirectUris.includes(redirectUri)) {
-            log("warn", "oauth_authorize_bad_redirect", { client_id: clientId, redirect_uri: redirectUri });
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "invalid_redirect_uri" }));
-            return;
-          }
+        if (client && client.redirectUris.length > 0 && !client.redirectUris.includes(redirectUri)) {
+          log("warn", "oauth_authorize_bad_redirect", { client_id: clientId, redirect_uri: redirectUri });
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "invalid_redirect_uri" }));
+          return;
         }
       }
 
-      const code = randomBytes(32).toString("hex");
-      authCodes.set(code, { expiresAt: Date.now() + 300_000 });
+      if (codeChallenge && codeChallengeMethod && codeChallengeMethod !== "S256") {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid_request", error_description: "only S256 PKCE is supported" }));
+        return;
+      }
 
-      log("info", "oauth_authorize", { client_id: clientId, redirect_uri: redirectUri });
+      // GET → show the login/consent form.
+      if (req.method === "GET") {
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(renderConsentPage(fields));
+        return;
+      }
+
+      // POST → authenticate the resource owner with the shared access secret.
+      const password = src.get("password") || "";
+      if (!AUTH_ACCESS_PASSWORD || !safeEqual(password, AUTH_ACCESS_PASSWORD)) {
+        log("warn", "oauth_authorize_denied", { client_id: clientId, ip: getClientIp(req) });
+        res.writeHead(401, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(renderConsentPage(fields, "Incorrect access secret."));
+        return;
+      }
+
+      const code = randomBytes(32).toString("hex");
+      authCodes.set(code, {
+        expiresAt: Date.now() + AUTH_CODE_TTL_MS,
+        clientId,
+        redirectUri: redirectUri || null,
+        codeChallenge,
+        resource: resource || null,
+      });
+      log("info", "oauth_authorize_granted", { client_id: clientId, redirect_uri: redirectUri, pkce: !!codeChallenge });
 
       if (redirectUri) {
         const redirect = new URL(redirectUri);
@@ -688,47 +891,98 @@ async function runHTTP(): Promise<void> {
 
         log("info", "oauth_token", { grant_type: grantType, client_id: clientId });
 
-        // Validate client credentials (constant-time comparison)
         const isStaticClient = !!clientId && !!clientSecret
           && safeEqual(clientId, AUTH_CLIENT_ID)
           && safeEqual(clientSecret, AUTH_CLIENT_SECRET);
         const registeredInfo = clientId ? registeredClients.get(clientId) : undefined;
-        const isRegisteredValid = !!registeredInfo
-          && (!clientSecret || safeEqual(clientSecret, registeredInfo.clientSecret));
 
+        const sendTokens = (withRefresh: boolean): void => {
+          const { token, expiresIn } = issueAccessToken();
+          const payload: Record<string, unknown> = {
+            access_token: token,
+            token_type: "bearer",
+            expires_in: expiresIn,
+          };
+          if (withRefresh) payload.refresh_token = issueRefreshToken(clientId || "");
+          saveAuthStore();
+          log("info", "oauth_token_issued", { client_id: clientId, grant_type: grantType });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(payload));
+        };
+
+        // ── client_credentials: machine-to-machine, static client ONLY ──────
         if (grantType === "client_credentials") {
-          if (isAuthEnabled() && !isStaticClient && !isRegisteredValid) {
+          if (isAuthEnabled() && !isStaticClient) {
             log("warn", "oauth_token_rejected", { client_id: clientId, reason: "invalid_client" });
             res.writeHead(401, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "invalid_client" }));
             return;
           }
+          sendTokens(false);
+          return;
         }
 
-        if (grantType === "client_credentials" || grantType === "authorization_code") {
-          if (grantType === "authorization_code") {
-            const code = params.get("code");
-            if (!code || !authCodes.has(code)) {
-              log("warn", "oauth_token_rejected", { client_id: clientId, reason: "invalid_grant" });
+        // ── authorization_code: consumes a code minted at /authorize ─────────
+        if (grantType === "authorization_code") {
+          const code = params.get("code") || "";
+          const entry = authCodes.get(code);
+          if (!entry || entry.expiresAt < Date.now()) {
+            if (entry) authCodes.delete(code);
+            log("warn", "oauth_token_rejected", { client_id: clientId, reason: "invalid_grant" });
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "invalid_grant" }));
+            return;
+          }
+          authCodes.delete(code); // single use
+
+          // Bind the code to the client and redirect_uri it was issued for.
+          const redirectUri = params.get("redirect_uri");
+          if ((entry.clientId && clientId && entry.clientId !== clientId)
+            || (entry.redirectUri && redirectUri !== entry.redirectUri)) {
+            log("warn", "oauth_token_rejected", { client_id: clientId, reason: "grant_mismatch" });
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "invalid_grant" }));
+            return;
+          }
+
+          // Enforce PKCE when the authorization request used it.
+          if (entry.codeChallenge) {
+            const verifier = params.get("code_verifier") || "";
+            if (!verifier || !verifyPkceS256(verifier, entry.codeChallenge)) {
+              log("warn", "oauth_token_rejected", { client_id: clientId, reason: "pkce_failed" });
               res.writeHead(400, { "Content-Type": "application/json" });
               res.end(JSON.stringify({ error: "invalid_grant" }));
               return;
             }
-            authCodes.delete(code);
           }
 
-          const token = randomBytes(48).toString("hex");
-          activeTokens.set(token, Date.now() + TOKEN_TTL_MS);
-          saveAuthStore();
+          // Authenticate confidential (registered) clients by their secret.
+          if (registeredInfo && registeredInfo.clientSecret && clientSecret
+            && !safeEqual(clientSecret, registeredInfo.clientSecret)) {
+            log("warn", "oauth_token_rejected", { client_id: clientId, reason: "invalid_client" });
+            res.writeHead(401, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "invalid_client" }));
+            return;
+          }
 
-          log("info", "oauth_token_issued", { client_id: clientId, grant_type: grantType });
+          sendTokens(true);
+          return;
+        }
 
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({
-            access_token: token,
-            token_type: "bearer",
-            expires_in: TOKEN_TTL_MS / 1000,
-          }));
+        // ── refresh_token: rotate and re-issue ──────────────────────────────
+        if (grantType === "refresh_token") {
+          const rt = params.get("refresh_token") || "";
+          const info = refreshTokens.get(rt);
+          if (!info || info.expiresAt < Date.now()) {
+            if (info) refreshTokens.delete(rt);
+            log("warn", "oauth_token_rejected", { client_id: clientId, reason: "invalid_grant" });
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "invalid_grant" }));
+            return;
+          }
+          refreshTokens.delete(rt); // rotation: old refresh token is invalidated
+          clientId = clientId || info.clientId;
+          sendTokens(true);
           return;
         }
 
@@ -751,7 +1005,10 @@ async function runHTTP(): Promise<void> {
     // ── Stats (protected) ─────────────────────────────────────────────────
     if (req.method === "GET" && req.url === "/stats") {
       if (!checkBearer(req)) {
-        res.writeHead(401, { "Content-Type": "application/json" });
+        res.writeHead(401, {
+          "Content-Type": "application/json",
+          "WWW-Authenticate": `Bearer resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`,
+        });
         res.end(JSON.stringify({ error: "unauthorized" }));
         return;
       }
@@ -767,6 +1024,12 @@ async function runHTTP(): Promise<void> {
 
     // ── MCP (protected) ───────────────────────────────────────────────────
     if (req.method === "POST" && req.url === "/mcp") {
+      if (!isOriginAllowed(req, baseUrl)) {
+        log("warn", "mcp_forbidden_origin", { origin: req.headers.origin, ip: getClientIp(req) });
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "forbidden_origin" }));
+        return;
+      }
       if (!checkBearer(req)) {
         log("warn", "mcp_unauthorized", { ip: getClientIp(req) });
         res.writeHead(401, {
@@ -802,6 +1065,14 @@ async function runHTTP(): Promise<void> {
           res.end(JSON.stringify({ error: msg }));
         }
       }
+      return;
+    }
+
+    // This server does not offer an SSE stream or client-terminated sessions,
+    // so per the Streamable HTTP spec GET/DELETE on the MCP endpoint are 405.
+    if (req.url === "/mcp" && (req.method === "GET" || req.method === "DELETE")) {
+      res.writeHead(405, { "Content-Type": "application/json", "Allow": "POST" });
+      res.end(JSON.stringify({ error: "method_not_allowed" }));
       return;
     }
 
