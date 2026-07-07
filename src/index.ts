@@ -548,6 +548,24 @@ async function runHTTP(): Promise<void> {
 
     const baseUrl = getBaseUrl(req);
 
+    // ── OAuth Protected Resource Metadata (RFC 9728) ──────────────────────
+    // Clients discover the resource FIRST, then follow authorization_servers
+    // to the authorization-server metadata below. Both the bare path and the
+    // "/mcp"-suffixed path are served, since clients try either.
+    if (
+      req.method === "GET" &&
+      (req.url === "/.well-known/oauth-protected-resource" ||
+        req.url === "/.well-known/oauth-protected-resource/mcp")
+    ) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        resource: `${baseUrl}/mcp`,
+        authorization_servers: [baseUrl],
+        bearer_methods_supported: ["header"],
+      }));
+      return;
+    }
+
     // ── OAuth Discovery ───────────────────────────────────────────────────
     if (req.method === "GET" && req.url === "/.well-known/oauth-authorization-server") {
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -751,7 +769,10 @@ async function runHTTP(): Promise<void> {
     if (req.method === "POST" && req.url === "/mcp") {
       if (!checkBearer(req)) {
         log("warn", "mcp_unauthorized", { ip: getClientIp(req) });
-        res.writeHead(401, { "Content-Type": "application/json" });
+        res.writeHead(401, {
+          "Content-Type": "application/json",
+          "WWW-Authenticate": `Bearer resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`,
+        });
         res.end(JSON.stringify({
           jsonrpc: "2.0",
           error: { code: -32001, message: "Unauthorized. Provide a valid Bearer token." },
